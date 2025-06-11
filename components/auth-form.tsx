@@ -34,12 +34,11 @@ export default function AuthForm({ mode }: AuthFormProps) {
       const data = await response.json()
 
       if (!response.ok) {
-        setError(data.message || `An error occurred during ${mode}.`)
+        setError(data.error || `An error occurred during ${mode}.`)
       } else {
         if (mode === "login") {
           localStorage.setItem("authToken", data.token)
-          localStorage.setItem("userId", data.userId)
-          localStorage.setItem("username", data.username)
+          localStorage.setItem("username", data.user.username)
           router.push("/dashboard")
         } else {
           // Redirect to login after successful signup

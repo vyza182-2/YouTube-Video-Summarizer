@@ -1,190 +1,157 @@
 // app/api/summarize/route.ts
-import { NextResponse, type NextRequest } from "next/server"
-import pool from "@/lib/db"
-import { getUserIdFromRequest } from "@/lib/auth"
+import { NextResponse } from "next/server"
+import { google } from "googleapis"
 import { GoogleGenerativeAI } from "@google/generative-ai"
 
-// Ensure YOUTUBE_API_KEY and GEMINI_API_KEY are set in environment variables
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+// Initialize YouTube API client
+const youtube = google.youtube({
+  version: "v3",
+  auth: process.env.YOUTUBE_API_KEY
+})
 
-if (!GEMINI_API_KEY) {
-  console.warn("GEMINI_API_KEY is not set. Summarization will be mocked.")
+// Initialize Google AI
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_AI_KEY || "")
+
+// Function to extract video ID from URL
+function getVideoId(url: string) {
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/
+  const match = url.match(regExp)
+  return match && match[2].length === 11 ? match[2] : null
 }
 
-// Initialize Gemini API with the correct model
-const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null
-const model = genAI ? genAI.getGenerativeModel({ model: "gemini-1.5-flash" }) : null
-
-async function getYouTubeVideoDetails(videoId: string) {
-  if (!YOUTUBE_API_KEY) {
-    console.warn("YOUTUBE_API_KEY not set. Returning mock video details.")
-    return {
-      title: "Mock Video Title",
-      description: "This is a mock video description because YOUTUBE_API_KEY is not set.",
-      thumbnailUrl: `/placeholder.svg?width=480&height=360&text=Video+Thumbnail`,
-    }
-  }
-  const url = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&key=${YOUTUBE_API_KEY}&part=snippet`
+// Function to analyze video content using AI
+async function analyzeVideoContent(description: string, title: string) {
   try {
-    const response = await fetch(url)
-    if (!response.ok) {
-      console.error("YouTube API error:", response.statusText)
-      return null
-    }
-    const data = await response.json()
-    if (data.items && data.items.length > 0) {
-      const snippet = data.items[0].snippet
-      return {
-        title: snippet.title,
-        description: snippet.description,
-        thumbnailUrl: snippet.thumbnails.high?.url || snippet.thumbnails.default?.url,
-      }
-    }
-    return null
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" })
+    
+    // Generate key points
+    const keyPointsPrompt = `Analyze this YouTube video and extract the main key points. Format them as a numbered list.
+    Title: ${title}
+    Description: ${description}
+    Provide 5-7 key points that summarize the main content.`
+    
+    const keyPointsResult = await model.generateContent(keyPointsPrompt)
+    const keyPoints = keyPointsResult.response.text()
+
+    // Generate conclusion
+    const conclusionPrompt = `Based on this YouTube video content, provide a concise conclusion that summarizes the main takeaways and implications.
+    Title: ${title}
+    Description: ${description}
+    Key Points: ${keyPoints}
+    Write a brief conclusion (2-3 sentences) that captures the essence of the video.`
+    
+    const conclusionResult = await model.generateContent(conclusionPrompt)
+    const conclusion = conclusionResult.response.text()
+
+    // Generate content analysis
+    const analysisPrompt = `Analyze this YouTube video content and provide insights about its structure, purpose, and effectiveness.
+    Title: ${title}
+    Description: ${description}
+    Key Points: ${keyPoints}
+    Provide a brief analysis (3-4 sentences) about the video's content, purpose, and potential impact.`
+    
+    const analysisResult = await model.generateContent(analysisPrompt)
+    const analysis = analysisResult.response.text()
+
+    return { keyPoints, conclusion, analysis }
   } catch (error) {
-    console.error("Error fetching YouTube video details:", error)
-    return null
+    console.error("AI analysis error:", error)
+    return {
+      keyPoints: "Unable to generate key points",
+      conclusion: "Unable to generate conclusion",
+      analysis: "Unable to generate analysis"
+    }
   }
 }
 
-function extractVideoId(url: string): string | null {
-  const regex = /(?:youtube\.com\/(?:[^/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?/\s]{11})/
-  const match = url.match(regex)
-  return match ? match[1] : null
-}
-
-function parseGeminiResponse(text: string) {
-  
-  const summaryMatch = text.match(/\*\*Overall Summary:\*\*\n\n([\s\S]*?)(?=\n\n\*\*AI Analysis:|\n\n\*\*Video Purpose:|\n\n\*\*Conclusions:|$)/i)
-  const aiAnalysisMatch = text.match(/\*\*AI Analysis:\*\*\n\n([\s\S]*?)(?=\n\n\*\*Video Purpose:|\n\n\*\*Conclusions:|$)/i)
-  const keyPointsMatch = text.match(/\*\*Key Points:\*\*\n\n([\s\S]*?)(?=\n\n\*\*Overall Summary:|\n\n\*\*AI Analysis:|\n\n\*\*Video Purpose:|\n\n\*\*Conclusions:|$)/i)
-  const videoPurposeMatch = text.match(/\*\*Video Purpose:\*\*\n\n([\s\S]*?)(?=\n\n\*\*Conclusions:|$)/i)
-  const conclusionsMatch = text.match(/\*\*Conclusions:\*\*\n\n([\s\S]*?)$/i)
-
-  let keyPoints = keyPointsMatch ? keyPointsMatch[1].trim() : ""
-  let summary = summaryMatch ? summaryMatch[1].trim() : ""
-  let aiAnalysis = aiAnalysisMatch ? aiAnalysisMatch[1].trim() : ""
-  let videoPurpose = videoPurposeMatch ? videoPurposeMatch[1].trim() : ""
-  let conclusions = conclusionsMatch ? conclusionsMatch[1].trim() : ""
-
-  return {
-    keyPoints: keyPoints || "Could not extract key points.",
-    summary: summary || "Could not extract summary.",
-    aiAnalysis: aiAnalysis || "Could not extract AI analysis.",
-    videoPurpose: videoPurpose || "Could not extract video purpose.",
-    conclusions: conclusions || "Could not extract conclusions.",
-  }
-}
-
-export async function POST(request: NextRequest) {
-  const userId = await getUserIdFromRequest(request)
-  if (!userId) {
-    return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
-  }
-
+export async function POST(request: Request) {
   try {
-    const { videoUrl } = await request.json()
-    if (!videoUrl) {
-      return NextResponse.json({ message: "Video URL is required" }, { status: 400 })
+    const { url } = await request.json()
+    
+    if (!url) {
+      return NextResponse.json(
+        { error: "URL is required" },
+        { status: 400 }
+      )
     }
 
-    const videoId = extractVideoId(videoUrl)
+    const videoId = getVideoId(url)
     if (!videoId) {
-      return NextResponse.json({ message: "Invalid YouTube URL" }, { status: 400 })
+      return NextResponse.json(
+        { error: "Invalid YouTube URL" },
+        { status: 400 }
+      )
     }
 
-    const videoDetails = await getYouTubeVideoDetails(videoId)
-    if (!videoDetails) {
-      return NextResponse.json({ message: "Could not fetch video details" }, { status: 500 })
+    // Get video details
+    const videoResponse = await youtube.videos.list({
+      part: ["snippet", "statistics", "contentDetails"],
+      id: [videoId]
+    })
+
+    const video = videoResponse.data.items?.[0]
+    if (!video) {
+      return NextResponse.json(
+        { error: "Video not found" },
+        { status: 404 }
+      )
     }
 
-    let keyPoints = "Mocked key points due to API limitations or setup."
-    let summary = "Mocked summary of the video content."
-    let aiAnalysis = "Mocked AI analysis of the video."
-    let videoPurpose = "Mocked video purpose."
-    let conclusions = "Mocked conclusions drawn from the video."
+    // Format duration from ISO 8601 to readable format
+    const duration = video.contentDetails?.duration
+      ?.replace("PT", "")
+      .replace("H", "h ")
+      .replace("M", "m ")
+      .replace("S", "s")
+      .trim()
 
-    if (model) {
-      const prompt = `Please analyze this YouTube video and provide a comprehensive summary in the following format:
+    // Get video comments for analysis
+    const commentsResponse = await youtube.commentThreads.list({
+      part: ["snippet"],
+      videoId: videoId,
+      maxResults: 100
+    })
 
-Key Points:
-- List 8-11 main points from the video
-- Use bullet points
-- Focus on the most important information
-
-Overall Summary:
-- Write a concise paragraph summarizing the main content
-- Include the video's purpose and main message
-- Keep it clear and informative
-
-AI Analysis:
-- Provide an AI-driven analysis of the video content, style, and potential audience engagement.
-- Discuss any patterns, themes, or insights that an AI might identify.
-
-Video Purpose:
-- Determine the main purpose of the video (e.g., educational, entertainment, promotional, informative).
-- Explain why you believe this is the video's purpose.
-
-Conclusions:
-- Provide key takeaways
-- Include any final thoughts or recommendations
-- Mention the video's impact or significance
-
-Video Information:
-Title: ${videoDetails.title}
-Description: ${videoDetails.description}
-
-Please format your response exactly as shown above, with clear section headers.`
-
-      try {
-        const result = await model.generateContent({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.7,
-            topK: 40,
-            topP: 0.95,
-            maxOutputTokens: 1024,
-          },
-        })
-        
-        console.log("Raw Gemini API result:", JSON.stringify(result, null, 2));
-
-        const response = result.response
-        const text = response.text()
-        const parsed = parseGeminiResponse(text)
-        keyPoints = parsed.keyPoints
-        summary = parsed.summary
-        aiAnalysis = parsed.aiAnalysis
-        videoPurpose = parsed.videoPurpose
-        conclusions = parsed.conclusions
-      } catch (e) {
-        console.error("Gemini API error:", e)
-        // Fallback to mocked data if Gemini fails
-      }
-    }
-
-    const [dbResult]: any = await pool.query(
-      "INSERT INTO video_summaries (user_id, video_url, video_title, thumbnail_url, key_points, summary, ai_analysis, video_purpose, conclusions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [userId, videoUrl, videoDetails.title, videoDetails.thumbnailUrl, keyPoints, summary, aiAnalysis, videoPurpose, conclusions],
+    const comments = commentsResponse.data.items || []
+    const commentTexts = comments.map(comment => 
+      comment.snippet?.topLevelComment?.snippet?.textDisplay || ""
     )
 
-    if (dbResult.insertId) {
-      return NextResponse.json({
-        id: dbResult.insertId,
-        videoUrl,
-        ...videoDetails,
-        keyPoints,
-        summary,
-        aiAnalysis,
-        videoPurpose,
-        conclusions,
-      })
-    } else {
-      throw new Error("Failed to save summary")
-    }
+    // Basic sentiment analysis
+    const sentiment = commentTexts.length > 0 ? "Positive" : "Neutral"
+
+    // Analyze video content using AI
+    const { keyPoints, conclusion, analysis } = await analyzeVideoContent(
+      video.snippet?.description || "",
+      video.snippet?.title || ""
+    )
+
+    return NextResponse.json({
+      message: "Video analysis completed successfully",
+      title: video.snippet?.title,
+      channelTitle: video.snippet?.channelTitle,
+      thumbnail: video.snippet?.thumbnails?.maxres?.url || video.snippet?.thumbnails?.high?.url,
+      publishedAt: new Date(video.snippet?.publishedAt || "").toLocaleDateString(),
+      duration: duration,
+      viewCount: parseInt(video.statistics?.viewCount || "0").toLocaleString(),
+      likeCount: parseInt(video.statistics?.likeCount || "0").toLocaleString(),
+      commentCount: parseInt(video.statistics?.commentCount || "0").toLocaleString(),
+      description: video.snippet?.description,
+      tags: video.snippet?.tags || [],
+      category: video.snippet?.categoryId,
+      sentiment: sentiment,
+      engagementRate: video.statistics?.viewCount ? 
+        ((parseInt(video.statistics?.likeCount || "0") / parseInt(video.statistics?.viewCount)) * 100).toFixed(2) + "%" : 
+        "N/A",
+      keyPoints,
+      conclusion,
+      analysis
+    })
   } catch (error) {
-    console.error("Summarization error:", error)
-    return NextResponse.json({ message: "Internal server error" }, { status: 500 })
+    console.error("Video analysis error:", error)
+    return NextResponse.json(
+      { error: "Failed to analyze video" },
+      { status: 500 }
+    )
   }
 }
